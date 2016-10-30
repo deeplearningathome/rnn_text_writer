@@ -58,11 +58,11 @@ from __future__ import print_function
 
 import time
 import sys
+sys.stdout = sys.stderr
 import numpy as np
 import tensorflow as tf
 
 import reader
-sys.stdout = sys.stderr
 
 flags = tf.flags
 logging = tf.logging
@@ -76,6 +76,12 @@ flags.DEFINE_string("save_path", None,
                     "Model output directory.")
 flags.DEFINE_bool("use_fp16", False,
                   "Train using 16-bit floats instead of 32bit floats")
+flags.DEFINE_bool("sample_mode", False,
+                  "Must have trained model ready. Only does sampling")
+flags.DEFINE_string("file_prefix", "ptb",
+                  "will be looking for file_prefix.train.txt, file_prefix.test.txt and file_prefix.valid.txt in data_path")
+flags.DEFINE_string("seed_for_sample", "hello",
+                  "supply seeding phrase here. it must only contain words from vocabluary")
 
 FLAGS = flags.FLAGS
 
@@ -84,35 +90,23 @@ def data_type():
   return tf.float16 if FLAGS.use_fp16 else tf.float32
 
 
-class PTBInput(object):
-  """The input data."""
-
-  def __init__(self, config, data, name=None):
-    self.batch_size = batch_size = config.batch_size
-    self.num_steps = num_steps = config.num_steps
-    self.epoch_size = ((len(data) // batch_size) - 1) // num_steps
-    self.input_data, self.targets = reader.ptb_producer(
-        data, batch_size, num_steps, name=name)
-
-
 class PTBModel(object):
   """The PTB model."""
 
-  def set_input(self, input):
-    self._input = input
+  def __init__(self, is_training, config):
 
-  def __init__(self, is_training, config, input_):
-    self.set_input(input=input_)
-
-    batch_size = input_.batch_size
-    num_steps = input_.num_steps
+    self.batch_size = batch_size = config.batch_size
+    self.num_steps = num_steps = config.num_steps
     size = config.hidden_size
     vocab_size = config.vocab_size
+
+    self._input_data = tf.placeholder(tf.int32, [batch_size, num_steps])
+    self._targets = tf.placeholder(tf.int32, [batch_size, num_steps])
 
     # Slightly better results can be obtained with forget gate biases
     # initialized to 1 but the hyperparameters of the model would need to be
     # different than reported in the paper.
-    lstm_cell = tf.nn.rnn_cell.LSTMCell(size, forget_bias=0.0, state_is_tuple=True)
+    lstm_cell = tf.nn.rnn_cell.BasicLSTMCell(size, forget_bias=0.0, state_is_tuple=True)
     if is_training and config.keep_prob < 1:
       lstm_cell = tf.nn.rnn_cell.DropoutWrapper(
           lstm_cell, output_keep_prob=config.keep_prob)
@@ -120,10 +114,11 @@ class PTBModel(object):
 
     self._initial_state = cell.zero_state(batch_size, data_type())
 
+
     with tf.device("/cpu:0"):
       embedding = tf.get_variable(
           "embedding", [vocab_size, size], dtype=data_type())
-      inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
+      inputs = tf.nn.embedding_lookup(embedding, self._input_data)
 
     if is_training and config.keep_prob < 1:
       inputs = tf.nn.dropout(inputs, config.keep_prob)
@@ -134,39 +129,45 @@ class PTBModel(object):
     #
     # The alternative version of the code below is:
     #
-    inputs = [tf.squeeze(input_step, [1]) for input_step in tf.split(1, num_steps, inputs)]
-    outputs, state = tf.nn.rnn(cell, inputs, initial_state=self._initial_state)
-
-    # outputs = []
-    # state = self._initial_state
-    # with tf.variable_scope("RNN"):
-    #   for time_step in range(num_steps):
-    #     if time_step > 0: tf.get_variable_scope().reuse_variables()
-    #     (cell_output, state) = cell(inputs[:, time_step, :], state)
-    #     outputs.append(cell_output)
+    # inputs = [tf.squeeze(input_step, [1])
+    #           for input_step in tf.split(1, num_steps, inputs)]
+    # outputs, state = tf.nn.rnn(cell, inputs, initial_state=self._initial_state)
+    outputs = []
+    state = self._initial_state
+    with tf.variable_scope("RNN"):
+      for time_step in range(num_steps):
+        if time_step > 0: tf.get_variable_scope().reuse_variables()
+        (cell_output, state) = cell(inputs[:, time_step, :], state)
+        outputs.append(cell_output)
 
     output = tf.reshape(tf.concat(1, outputs), [-1, size])
     softmax_w = tf.get_variable(
         "softmax_w", [size, vocab_size], dtype=data_type())
     softmax_b = tf.get_variable("softmax_b", [vocab_size], dtype=data_type())
-    self._logits = logits = tf.matmul(output, softmax_w) + softmax_b
+    logits = tf.matmul(output, softmax_w) + softmax_b
+    self.sample = tf.multinomial(logits, 1)
     loss = tf.nn.seq2seq.sequence_loss_by_example(
         [logits],
-        [tf.reshape(input_.targets, [-1])],
+        [tf.reshape(self._targets, [-1])],
         [tf.ones([batch_size * num_steps], dtype=data_type())])
     self._cost = cost = tf.reduce_sum(loss) / batch_size
     self._final_state = state
-
     if not is_training:
-      self.sample = tf.multinomial(logits, 1, seed=None, name="Sample")
-      self.argmax = tf.arg_max(logits, 1, name="Argmax")
       return
 
     self._lr = tf.Variable(0.0, trainable=False)
     tvars = tf.trainable_variables()
     grads, _ = tf.clip_by_global_norm(tf.gradients(cost, tvars),
                                       config.max_grad_norm)
-    optimizer = tf.train.GradientDescentOptimizer(self._lr)
+    if config.optimizer == 'RMSPropOptimizer':
+      optimizer = tf.train.RMSPropOptimizer(self._lr)
+    elif config.optimizer == 'AdamOptimizer':
+      optimizer = tf.train.AdamOptimizer()
+    elif config.optimizer == 'MomentumOptimizer':
+      optimizer = tf.train.MomentumOptimizer(self._lr, momentum=0.8, use_nesterov=True)
+    else:
+      optimizer = tf.train.GradientDescentOptimizer(self._lr)
+    #optimizer = tf.train.RMSPropOptimizer(self._lr)
     self._train_op = optimizer.apply_gradients(
         zip(grads, tvars),
         global_step=tf.contrib.framework.get_or_create_global_step())
@@ -179,16 +180,17 @@ class PTBModel(object):
     session.run(self._lr_update, feed_dict={self._new_lr: lr_value})
 
   @property
-  def input(self):
-    return self._input
+  def input_data(self):
+    return self._input_data
+
+  @property
+  def targets(self):
+    return self._targets
+
 
   @property
   def initial_state(self):
     return self._initial_state
-
-  @property
-  def logits(self):
-    return self._logits
 
   @property
   def cost(self):
@@ -209,6 +211,8 @@ class PTBModel(object):
 
 class SmallConfig(object):
   """Small config."""
+  is_char_model = False
+  optimizer = 'AdamOptimizer'
   init_scale = 0.1
   learning_rate = 1.0
   max_grad_norm = 5
@@ -225,6 +229,8 @@ class SmallConfig(object):
 
 class MediumConfig(object):
   """Medium config."""
+  is_char_model = False
+  optimizer = 'GradientDescentOptimizer'
   init_scale = 0.05
   learning_rate = 1.0
   max_grad_norm = 5
@@ -241,6 +247,8 @@ class MediumConfig(object):
 
 class LargeConfig(object):
   """Large config."""
+  is_char_model = False
+  optimizer = 'GradientDescentOptimizer'
   init_scale = 0.04
   learning_rate = 1.0
   max_grad_norm = 10
@@ -254,24 +262,66 @@ class LargeConfig(object):
   batch_size = 20
   vocab_size = 10000
 
-class XLargeConfig(object):
+
+class CharLargeConfig(object):
   """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
+  is_char_model = True
+  optimizer = 'MomentumOptimizer'
+  init_scale = 0.004
+  learning_rate = 0.05
+  max_grad_norm = 15
   num_layers = 3
-  num_steps = 50
-  hidden_size = 1024
+  num_steps = 100
+  hidden_size = 512
   max_epoch = 14
-  max_max_epoch = 100
-  keep_prob = 0.35
-  lr_decay = 1 / 1.12
+  max_max_epoch = 255
+  keep_prob = 0.5
+  lr_decay = 1 / 1.15
+  #batch_size = 64
+  batch_size = 1
+  vocab_size = 10000
+
+class CharLargeConfig1(object):
+  """Large config."""
+  is_char_model = True
+  optimizer = 'RMSPropOptimizer'
+  init_scale = 0.004
+  learning_rate = 0.01
+  max_grad_norm = 15
+  num_layers = 3
+  num_steps = 128
+  hidden_size = 512
+  max_epoch = 14
+  max_max_epoch = 255
+  keep_prob = 0.5
+  lr_decay = 1 / 1.15
   batch_size = 16
   vocab_size = 10000
 
 
+class CharSmallConfig(object):
+  """Large config."""
+  is_char_model = True
+  optimizer = 'RMSPropOptimizer'
+  init_scale = 0.04
+  learning_rate = 0.05
+  max_grad_norm = 15
+  num_layers = 3
+  num_steps = 128
+  hidden_size = 256
+  max_epoch = 14
+  max_max_epoch = 155
+  keep_prob = 0.5
+  lr_decay = 1 / 1.15
+  batch_size = 8
+  vocab_size = 10000
+
+
+
 class TestConfig(object):
   """Tiny config, for testing."""
+  is_char_model = False
+  optimizer = 'GradientDescentOptimizer'
   init_scale = 0.1
   learning_rate = 1.0
   max_grad_norm = 1
@@ -286,71 +336,77 @@ class TestConfig(object):
   vocab_size = 10000
 
 
-def do_sample(session, model, id_2_word, num_samples):
-  """Samples from output probability distribution.
-  Here we also assume that batch_size=1 and num_steps=1 for the model
-  """
+def do_sample(session, model, data, num_samples):
+  """Sampled from the model"""
   samples = []
-
   state = session.run(model.initial_state)
-  fetches = {
-    "sample": model.sample,
-    #"argmax": model.argmax,
-    "final_state": model.final_state,
-  }
-
-  for step in range(model.input.epoch_size):
+  fetches = [model.final_state, model.sample]
+  sample = None
+  for x in data:
     feed_dict = {}
-    for i, (c, h) in enumerate(model.initial_state):
-      feed_dict[c] = state[i].c
-      feed_dict[h] = state[i].h
+    feed_dict[model.input_data] = [[x]]
+    for layer_num, (c, h) in enumerate(model.initial_state):
+      feed_dict[c] = state[layer_num].c
+      feed_dict[h] = state[layer_num].h
 
-    vals = session.run(fetches, feed_dict)
-    samples.append(vals['sample'][0][0])
-    #samples.append(vals['argmax'][0])
+    state, sample = session.run(fetches, feed_dict)
+  if sample is not None:
+    samples.append(sample[0][0])
+  else:
+    samples.append(0)
+  k = 1
+  while k < num_samples:
+    feed_dict = {}
+    feed_dict[model.input_data] = [[samples[-1]]]
+    for layer_num, (c, h) in enumerate(model.initial_state):
+      feed_dict[c] = state[layer_num].c
+      feed_dict[h] = state[layer_num].h
+    state, sample = session.run(fetches, feed_dict)
+    samples.append(sample[0][0])
+    k += 1
+  return samples
 
-  while len(samples) < num_samples:
-    vals = session.run(fetches, feed_dict)
-    samples.append(vals['sample'][0][0])
-    #samples.append(vals['argmax'][0])
 
-  return ' '.join([id_2_word[ind] for ind in samples])
-
-
-
-def run_epoch(session, model, eval_op=None, verbose=False):
+def run_epoch(session, model, data, is_train=False, verbose=False):
   """Runs the model on the given data."""
+  epoch_size = ((len(data) // model.batch_size) - 1) // model.num_steps
   start_time = time.time()
   costs = 0.0
   iters = 0
   state = session.run(model.initial_state)
 
-  fetches = {
-      "cost": model.cost,
-      "final_state": model.final_state,
-  }
-  if eval_op is not None:
-    fetches["eval_op"] = eval_op
-
-  for step in range(model.input.epoch_size):
+  for step, (x, y) in enumerate(reader.ptb_iterator(data, model.batch_size, model.num_steps)):
+    if is_train:
+      fetches = [model.cost, model.final_state, model.train_op]
+    else:
+      fetches = [model.cost, model.final_state]
     feed_dict = {}
-    for i, (c, h) in enumerate(model.initial_state):
-      feed_dict[c] = state[i].c
-      feed_dict[h] = state[i].h
+    feed_dict[model.input_data] = x
+    feed_dict[model.targets] = y
+    for layer_num, (c, h) in enumerate(model.initial_state):
+      feed_dict[c] = state[layer_num].c
+      feed_dict[h] = state[layer_num].h
 
-    vals = session.run(fetches, feed_dict)
-    cost = vals["cost"]
-    state = vals["final_state"]
+    if is_train:
+      cost, state, _ = session.run(fetches, feed_dict)
+    else:
+      cost, state = session.run(fetches, feed_dict)
 
     costs += cost
-    iters += model.input.num_steps
+    iters += model.num_steps
 
-    if verbose and step % (model.input.epoch_size // 10) == 10:
+    if verbose and step % (epoch_size // 10) == 10:
       print("%.3f perplexity: %.3f speed: %.0f wps" %
-            (step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
-             iters * model.input.batch_size / (time.time() - start_time)))
+            (step * 1.0 / epoch_size, np.exp(costs / iters),
+             iters * model.batch_size / (time.time() - start_time)))
 
   return np.exp(costs / iters)
+
+def pretty_print(items, is_char_model, id2word):
+  if not is_char_model:
+    return ' '.join([id2word[x] for x in items])
+  else:
+    return ''.join([id2word[x] for x in items]).replace('_', ' ')
 
 
 def get_config():
@@ -360,86 +416,102 @@ def get_config():
     return MediumConfig()
   elif FLAGS.model == "large":
     return LargeConfig()
-  elif FLAGS.model == "xlarge":
-    return XLargeConfig()
   elif FLAGS.model == "test":
     return TestConfig()
+  elif FLAGS.model == "charlarge":
+    return CharLargeConfig()
+  elif FLAGS.model == "charlarge1":
+    return CharLargeConfig1()
+  elif FLAGS.model == "charsmall":
+    return CharSmallConfig()
   else:
     raise ValueError("Invalid model: %s", FLAGS.model)
-
 
 def main(_):
   if not FLAGS.data_path:
     raise ValueError("Must set --data_path to PTB data directory")
 
-  raw_data = reader.ptb_raw_data(FLAGS.data_path)
-  train_data, valid_data, test_data, vocabulary, word_to_id, id_2_word = raw_data
-
+  raw_data = reader.ptb_raw_data(FLAGS.data_path, FLAGS.file_prefix)
+  train_data, valid_data, test_data, word_to_id, id_2_word = raw_data
+  vocab_size = len(word_to_id)
+  #print(word_to_id)
+  print('Distinct terms: %d' % vocab_size)
   config = get_config()
+  config.vocab_size = config.vocab_size if config.vocab_size < vocab_size else vocab_size
   eval_config = get_config()
+  eval_config.vocab_size = eval_config.vocab_size if eval_config.vocab_size < vocab_size else vocab_size
   eval_config.batch_size = 1
   eval_config.num_steps = 1
 
-  sampler_input = ['for', 'the', 'full', 'quarter', 'our', 'bookings']
+  if config.is_char_model:
+    seed_for_sample = [c for c in FLAGS.seed_for_sample.replace(' ', '_')]
+  else:
+    seed_for_sample = FLAGS.seed_for_sample.split()
 
-  start_t = time.time()
   with tf.Graph().as_default():
     initializer = tf.random_uniform_initializer(-config.init_scale,
                                                 config.init_scale)
-
     with tf.name_scope("Train"):
-      train_input = PTBInput(config=config, data=train_data, name="TrainInput")
+
       with tf.variable_scope("Model", reuse=None, initializer=initializer):
-        m = PTBModel(is_training=True, config=config, input_=train_input)
-      tf.scalar_summary("Training Loss", m.cost)
-      tf.scalar_summary("Learning Rate", m.lr)
+        m = PTBModel(is_training=True, config=config)
+        tf.scalar_summary("Training Loss", m.cost)
+        tf.scalar_summary("Learning Rate", m.lr)
 
     with tf.name_scope("Valid"):
-      valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
       with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
-      tf.scalar_summary("Validation Loss", mvalid.cost)
-
-
-    with tf.name_scope("Sampler"):
-      sample_input = PTBInput(config=eval_config, data=[word_to_id[word] for word in sampler_input], name="SampleInput")
-      with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        msample = PTBModel(is_training=False, config=eval_config,
-                         input_=sample_input)
+        mvalid = PTBModel(is_training=False, config=config)
+        tf.scalar_summary("Validation Loss", mvalid.cost)
 
     with tf.name_scope("Test"):
-      test_input = PTBInput(config=config, data=test_data, name="TestInput")
       with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        mtest = PTBModel(is_training=False, config=eval_config,
-                         input_=test_input)
+        mtest = PTBModel(is_training=False, config=eval_config)
 
-    sv = tf.train.Supervisor(logdir=FLAGS.save_path)
+    saver = tf.train.Saver(name='saver', write_version=tf.train.SaverDef.V2)
+    sv = tf.train.Supervisor(logdir=FLAGS.save_path, save_model_secs=0, save_summaries_secs=0, saver=saver)
+
+    old_valid_perplexity = 10000000000.0
     with sv.managed_session() as session:
+      if FLAGS.sample_mode:
+        while True:
+          inpt = raw_input("Enter your sample prefix: ")
+          cnt = int(raw_input("Sample size: "))
+          if config.is_char_model:
+            seed_for_sample = [c for c in inpt.replace(' ', '_')]
+          else:
+            seed_for_sample = inpt.split()
+          print("Seed: %s" % pretty_print([word_to_id[x] for x in seed_for_sample], config.is_char_model, id_2_word))
+          print("Sample: %s" % pretty_print(do_sample(session, mtest, [word_to_id[word] for word in seed_for_sample],
+                                                      cnt), config.is_char_model, id_2_word))
+
       for i in range(config.max_max_epoch):
+
+        print("Seed: %s" % pretty_print([word_to_id[x] for x in seed_for_sample], config.is_char_model, id_2_word))
+        print("Sample: %s" % pretty_print(do_sample(session, mtest, [word_to_id[word] for word in seed_for_sample],
+                                                    max(5 * (len(seed_for_sample) + 1), 10)), config.is_char_model, id_2_word))
+
         lr_decay = config.lr_decay ** max(i - config.max_epoch, 0.0)
         m.assign_lr(session, config.learning_rate * lr_decay)
-
         print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-        train_perplexity = run_epoch(session, m, eval_op=m.train_op,
-                                     verbose=True)
+        train_perplexity = run_epoch(session, m, train_data, is_train=True, verbose=True)
         print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-        valid_perplexity = run_epoch(session, mvalid)
+        valid_perplexity = run_epoch(session, mvalid, valid_data)
         print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+        if valid_perplexity < old_valid_perplexity:
+          old_valid_perplexity = valid_perplexity
+          sv.saver.save(session, FLAGS.save_path, i)
+        elif valid_perplexity >= 1.3*old_valid_perplexity:
+          if len(sv.saver.last_checkpoints)>0:
+            sv.saver.restore(session, sv.saver.last_checkpoints[-1])
+          break
+        else:
+          if len(sv.saver.last_checkpoints)>0:
+            sv.saver.restore(session, sv.saver.last_checkpoints[-1])
+          lr_decay *=0.5
 
-        print('Sampling')
-        print('Input: %s' % ' '.join(sampler_input))
-        print('Continuation: %s' % do_sample(session, msample, id_2_word, 2*len(sampler_input)))
-
-
-      test_perplexity = run_epoch(session, mtest)
+      test_perplexity = run_epoch(session, mtest, test_data)
       print("Test Perplexity: %.3f" % test_perplexity)
 
-      if FLAGS.save_path:
-        print("Saving model to %s." % FLAGS.save_path)
-        sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
-
-  end_t = time.time()
-  print("Total Time: %s" % (end_t - start_t))
 
 if __name__ == "__main__":
   tf.app.run()
