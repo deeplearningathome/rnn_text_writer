@@ -106,11 +106,11 @@ class PTBModel(object):
     # Slightly better results can be obtained with forget gate biases
     # initialized to 1 but the hyperparameters of the model would need to be
     # different than reported in the paper.
-    lstm_cell = tf.nn.rnn_cell.BasicLSTMCell(size, forget_bias=0.0, state_is_tuple=True)
+    lstm_cell = tf.contrib.rnn.BasicLSTMCell(size, forget_bias=0.0, state_is_tuple=True)
     if is_training and config.keep_prob < 1:
-      lstm_cell = tf.nn.rnn_cell.DropoutWrapper(
+      lstm_cell = tf.contrib.rnn.DropoutWrapper(
           lstm_cell, output_keep_prob=config.keep_prob)
-    cell = tf.nn.rnn_cell.MultiRNNCell([lstm_cell] * config.num_layers, state_is_tuple=True)
+    cell = tf.contrib.rnn.MultiRNNCell([lstm_cell] * config.num_layers, state_is_tuple=True)
 
     self._initial_state = cell.zero_state(batch_size, data_type())
 
@@ -140,13 +140,13 @@ class PTBModel(object):
         (cell_output, state) = cell(inputs[:, time_step, :], state)
         outputs.append(cell_output)
 
-    output = tf.reshape(tf.concat(1, outputs), [-1, size])
+    output = tf.reshape(tf.concat(axis=1, values=outputs), [-1, size])
     softmax_w = tf.get_variable(
         "softmax_w", [size, vocab_size], dtype=data_type())
     softmax_b = tf.get_variable("softmax_b", [vocab_size], dtype=data_type())
     logits = tf.matmul(output, softmax_w) + softmax_b
     self.sample = tf.multinomial(logits, 1)
-    loss = tf.nn.seq2seq.sequence_loss_by_example(
+    loss = tf.contrib.legacy_seq2seq.sequence_loss_by_example(
         [logits],
         [tf.reshape(self._targets, [-1])],
         [tf.ones([batch_size * num_steps], dtype=data_type())])
@@ -455,13 +455,13 @@ def main(_):
 
       with tf.variable_scope("Model", reuse=None, initializer=initializer):
         m = PTBModel(is_training=True, config=config)
-        tf.scalar_summary("Training Loss", m.cost)
-        tf.scalar_summary("Learning Rate", m.lr)
+        tf.summary.scalar("Training Loss", m.cost)
+        tf.summary.scalar("Learning Rate", m.lr)
 
     with tf.name_scope("Valid"):
       with tf.variable_scope("Model", reuse=True, initializer=initializer):
         mvalid = PTBModel(is_training=False, config=config)
-        tf.scalar_summary("Validation Loss", mvalid.cost)
+        tf.summary.scalar("Validation Loss", mvalid.cost)
 
     with tf.name_scope("Test"):
       with tf.variable_scope("Model", reuse=True, initializer=initializer):
@@ -471,6 +471,8 @@ def main(_):
     sv = tf.train.Supervisor(logdir=FLAGS.save_path, save_model_secs=0, save_summaries_secs=0, saver=saver)
 
     old_valid_perplexity = 10000000000.0
+    #sessconfig = tf.ConfigProto(allow_soft_placement=True)
+    #sessconfig.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
     with sv.managed_session() as session:
       if FLAGS.sample_mode:
         while True:
